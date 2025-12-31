@@ -40,36 +40,7 @@ FRAMERATE = os.environ.get("FRAMERATE", "30")
 # RESOLUTION example: "1920x1080" or "3840x2160". If empty, no scaling is applied.
 RESOLUTION = os.environ.get("RESOLUTION", "1920x1080")
 # Buffer size controls variability; default kept at 2x video bitrate if not provided.
-_env_buf = os.environ.get("BUF_SIZE")
-# Optional hardware encoder flag (set to '1' to enable NVENC path)
-USE_NVENC = os.environ.get("USE_NVENC", "0") in ("1", "true", "True")
-
-
-def _parse_bitrate_k(bstr: str) -> int:
-    """Parse bitrate strings like '4500k' or '23M' and return kbps as int."""
-    s = bstr.strip()
-    if s.lower().endswith('k'):
-        try:
-            return int(float(s[:-1]))
-        except Exception:
-            return int(4500)
-    if s.lower().endswith('m'):
-        try:
-            return int(float(s[:-1]) * 1000)
-        except Exception:
-            return int(4500)
-    try:
-        return int(float(s))
-    except Exception:
-        return int(4500)
-
-
-if _env_buf:
-    BUF_SIZE = _env_buf
-else:
-    # default ~2x video bitrate
-    vb_k = _parse_bitrate_k(VIDEO_BITRATE)
-    BUF_SIZE = f"{max(2000, vb_k * 2)}k"
+BUF_SIZE = os.environ.get("BUF_SIZE", "9000k")
 LOG_PATH = BASE_DIR / "stream.log"
 PID_PATH = BASE_DIR / "ffmpeg_stream.pid"
 
@@ -79,48 +50,38 @@ VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 # Helper to ensure a path is a regular file. If a directory exists at the
 # location, move it aside (backup) and create an empty file. This prevents
 # IsADirectoryError when opening logs or other files.
-def _ensure_file(path: Path):
-    """Ensure `path` is a regular file. If a directory exists at `path`, move
-    it to a backup name and return the backup path. Returns list of backups (may be empty).
-    """
-    backups = []
-    if path.exists():
-        if path.is_dir():
-            ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-            backup = path.with_name(path.name + f'.bak-{ts}')
-            try:
-                shutil.move(str(path), str(backup))
-                backups.append(str(backup))
-            except Exception:
-                # try remove if empty
+def _ensure_file(path: Path) -> None:
+    try:
+        if path.exists():
+            if path.is_dir():
+                ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+                backup = path.with_name(path.name + f'.bak-{ts}')
                 try:
-                    path.rmdir()
+                    shutil.move(str(path), str(backup))
+                    log_event(f"Moved directory {path} to backup {backup}")
                 except Exception:
-                    raise
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(exist_ok=True)
-    return backups
+                    # try remove if empty
+                    try:
+                        path.rmdir()
+                    except Exception:
+                        raise
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+    except Exception:
+        # re-raise so caller can see the failure
+        raise
 
 
 # Ensure log and playlist files exist and are regular files
-_backups_log = _ensure_file(LOG_PATH)
-_backups_playlist = _ensure_file(PLAYLIST_PATH)
+_ensure_file(LOG_PATH)
+_ensure_file(PLAYLIST_PATH)
 
 
 def log_event(message: str) -> None:
     ts = datetime.utcnow().isoformat() + "Z"
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {message}\n")
-
-# After log_event is available, record any backups created during startup
-try:
-    for b in _backups_log + _backups_playlist:
-        if b:
-            log_event(f"Startup: moved unexpected directory to backup {b}")
-except Exception:
-    # If logging fails, nothing more we can do here
-    pass
 
 
 class StreamController:
@@ -136,15 +97,44 @@ class StreamController:
         self._monitor_thread: Optional[threading.Thread] = None
 
     def _pidfile_exists_and_alive(self) -> Optional[int]:
+        # Return PID if pidfile exists and refers to a running ffmpeg process.
         if PID_PATH.exists():
             try:
                 pid = int(PID_PATH.read_text().strip())
             except Exception:
                 return None
+
+            # Check /proc/<pid>/cmdline for 'ffmpeg' on Linux
             try:
-                os.kill(pid, 0)
-                return pid
-            except OSError:
+                cmdline_path = Path(f"/proc/{pid}/cmdline")
+                if cmdline_path.exists():
+                    cmd = cmdline_path.read_bytes().replace(b"\x00", b" ").decode(errors="ignore")
+                    if "ffmpeg" in cmd:
+                        return pid
+                    else:
+                        # Not an ffmpeg process; stale pidfile
+                        try:
+                            PID_PATH.unlink()
+                        except Exception:
+                            pass
+                        return None
+                else:
+                    # Fallback: try os.kill 0
+                    try:
+                        os.kill(pid, 0)
+                        return pid
+                    except Exception:
+                        try:
+                            PID_PATH.unlink()
+                        except Exception:
+                            pass
+                        return None
+            except Exception:
+                # On any error, treat as not alive
+                try:
+                    PID_PATH.unlink()
+                except Exception:
+                    pass
                 return None
         return None
 
@@ -160,19 +150,7 @@ class StreamController:
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
         # x264 params: enforce constant keyint/gop and disable scenecut for stable GOPs
         x264_params = "keyint=60:min-keyint=60:no-scenecut=1"
-
-        # Choose H.264 level based on resolution; 4K often requires level 5.1
-        level = "4.2"
-        if RESOLUTION and "x" in RESOLUTION:
-            try:
-                w, h = [int(x) for x in RESOLUTION.split('x')]
-                if max(w, h) >= 3840:
-                    level = "5.1"
-            except Exception:
-                pass
-
-        # Build basic input + encoding params; choose software or NVENC path later
-        base = [
+        cmd = [
             "ffmpeg",
             "-re",
             "-f",
@@ -186,9 +164,7 @@ class StreamController:
             # input handling
             "-fflags",
             "+genpts",
-        ]
-
-        sw_video = [
+            # video encoding
             "-c:v",
             "libx264",
             "-preset",
@@ -196,61 +172,28 @@ class StreamController:
             "-profile:v",
             "high",
             "-level:v",
-            level,
+            "4.2",
             "-x264-params",
             x264_params,
             "-threads",
             "0",
             "-b:v",
-            VIDEO_BITRATE,
+            "4500k",
             "-maxrate",
-            VIDEO_BITRATE,
+            "4500k",
             "-bufsize",
-            BUF_SIZE,
+            "9000k",
             "-r",
-            FRAMERATE,
+            "30",
             "-pix_fmt",
             "yuv420p",
             "-g",
             "60",
-        ]
-
-        # Hardware encoder parameters (NVENC) — requires host with NVIDIA GPU and ffmpeg built with nvenc
-        hw_video = [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-rc",
-            "vbr",
-            "-b:v",
-            VIDEO_BITRATE,
-            "-maxrate",
-            VIDEO_BITRATE,
-            "-bufsize",
-            BUF_SIZE,
-            "-r",
-            FRAMERATE,
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            "60",
-        ]
-
-        cmd = base + (hw_video if USE_NVENC else sw_video)
-
-        # Optionally scale to target resolution (don't upscale by default unless requested)
-        if RESOLUTION:
-            # Add a video filter to scale; avoid upscaling low-res content artificially
-            cmd.extend(["-vf", f"scale={RESOLUTION}"])
-
-        # continue building command with audio and output
-        cmd.extend([
             # audio encoding
             "-c:a",
             "aac",
             "-b:a",
-            AUDIO_BITRATE,
+            "160k",
             "-ar",
             "44100",
             # output format
@@ -259,7 +202,7 @@ class StreamController:
             "-f",
             "flv",
             rtmp_url,
-        ])
+        ]
         return cmd
 
 
@@ -270,6 +213,16 @@ class StreamController:
             lf.write(f"[{datetime.utcnow().isoformat()}Z] Launching FFmpeg: {shlex.join(cmd)}\n")
             lf.flush()
             proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL)
+            # give ffmpeg a short moment to fail-fast (invalid args, immediate exit)
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                lf.write(f"[{datetime.utcnow().isoformat()}Z] FFmpeg exited immediately with code {proc.returncode}\n")
+                lf.flush()
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+                return None
         except Exception as e:
             lf.write(f"[{datetime.utcnow().isoformat()}Z] Failed to start ffmpeg: {e}\n")
             lf.close()
@@ -285,10 +238,15 @@ class StreamController:
 
         self._proc = proc
         log_event(f"Started streaming (pid={proc.pid})")
+        # Also record the full command line to the log for diagnostics
+        try:
+            log_event(f"FFmpeg command: {shlex.join(cmd)}")
+        except Exception:
+            pass
         return proc
 
 
-    def start(self, stream_key: str, shuffle: bool = False, autorestart: bool = True) -> bool:
+    def start(self, stream_key: str, shuffle: bool = False, autorestart: bool = True, videos_dir: Optional[str] = None) -> bool:
         """Start FFmpeg streaming. Returns True on successful start.
 
         This will regenerate the playlist before launching FFmpeg.
@@ -297,7 +255,8 @@ class StreamController:
             if self.is_running():
                 return False
 
-            files = scan_and_write_playlist(str(VIDEOS_DIR), str(PLAYLIST_PATH), shuffle=shuffle)
+            vd = videos_dir or str(VIDEOS_DIR)
+            files = scan_and_write_playlist(str(vd), str(PLAYLIST_PATH), shuffle=shuffle)
             if not files:
                 log_event("Start requested but no videos found; aborting start")
                 return False
@@ -348,6 +307,77 @@ class StreamController:
                 t.start()
 
             return True
+
+    def get_running_info(self) -> Optional[dict]:
+        """Return info about a running ffmpeg process if present: {'pid': int, 'cmdline': str} or None."""
+        pid = self._pidfile_exists_and_alive()
+        if not pid:
+            # fallback to in-process handle
+            if self._proc and self._proc.poll() is None:
+                pid = self._proc.pid
+        if not pid:
+            return None
+
+        cmdline = ""
+        try:
+            cmdpath = Path(f"/proc/{pid}/cmdline")
+            if cmdpath.exists():
+                cmdline = cmdpath.read_bytes().replace(b"\x00", b" ").decode(errors="ignore")
+            else:
+                # fallback to ps
+                try:
+                    out = subprocess.check_output(["ps", "-p", str(pid), "-o", "args="], stderr=subprocess.DEVNULL)
+                    cmdline = out.decode(errors="ignore").strip()
+                except Exception:
+                    cmdline = ""
+        except Exception:
+            cmdline = ""
+
+        return {"pid": pid, "cmdline": cmdline}
+
+    def force_stop(self, timeout: int = 5) -> bool:
+        """Aggressively stop the ffmpeg process referenced by the pidfile (SIGKILL).
+        Returns True if something was killed, otherwise False.
+        """
+        with self._lock:
+            self._should_run = False
+            pid = None
+            try:
+                pid = int(PID_PATH.read_text().strip()) if PID_PATH.exists() else None
+            except Exception:
+                pid = None
+
+            killed = False
+            if pid:
+                try:
+                    # log the cmdline for diagnostics
+                    info = self.get_running_info()
+                    log_event(f"Force-stop requested (pid={pid}) cmdline={info.get('cmdline') if info else ''}")
+                except Exception:
+                    pass
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed = True
+                except Exception:
+                    killed = False
+
+            # also kill in-process handle if present
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                    killed = True
+                except Exception:
+                    pass
+
+            try:
+                if PID_PATH.exists():
+                    PID_PATH.unlink()
+            except Exception:
+                pass
+
+            if killed:
+                log_event(f"Force-stopped ffmpeg (pid={pid})")
+            return killed
 
     def stop(self, timeout: int = 10) -> bool:
         """Stop the FFmpeg process gracefully, return True if stopped."""
@@ -454,8 +484,55 @@ def main():
     # Shuffle option
     shuffle = st.checkbox("Shuffle playlist", value=False)
 
+    # Folder selector: simple navigator to pick a folder without typing absolute paths
+    if 'videos_dir' not in st.session_state:
+        st.session_state.videos_dir = str(VIDEOS_DIR)
+    if 'videos_dir_browser_current' not in st.session_state:
+        st.session_state.videos_dir_browser_current = st.session_state.videos_dir
+
+    st.subheader("Videos folder")
+    browser_current = Path(st.session_state.videos_dir_browser_current)
+    st.write("Current folder:", str(browser_current))
+
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
+    with nav_col1:
+        if st.button("Up", key="nav_up"):
+            parent = browser_current.parent
+            if parent.exists() and parent.is_dir():
+                st.session_state.videos_dir_browser_current = str(parent)
+    with nav_col2:
+        if st.button("Use this folder", key="nav_use"):
+            if not browser_current.exists() or not browser_current.is_dir():
+                st.error("Selected path does not exist or is not a directory")
+            else:
+                st.session_state.videos_dir = str(browser_current)
+                st.success(f"Using videos folder: {browser_current}")
+    with nav_col3:
+        if st.button("Reset to default", key="nav_reset"):
+            st.session_state.videos_dir = str(VIDEOS_DIR)
+            st.session_state.videos_dir_browser_current = str(VIDEOS_DIR)
+            st.success(f"Reset to default videos folder: {VIDEOS_DIR}")
+
+    # List subdirectories so user can navigate into them
+    try:
+        subdirs = sorted([p for p in browser_current.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+    except Exception:
+        subdirs = []
+
+    if subdirs:
+        st.write("Subfolders:")
+        for d in subdirs:
+            btn_label = f"Open: {d.name}"
+            if st.button(btn_label, key=f"open_{str(d)}"):
+                st.session_state.videos_dir_browser_current = str(d)
+    else:
+        st.info("No subfolders found in this folder")
+
+    # The effective videos folder used by actions
+    current_videos_dir = Path(st.session_state.videos_dir)
+
     # Show detected videos and regenerate automatically each run
-    files = scan_videos(str(VIDEOS_DIR))
+    files = scan_videos(str(current_videos_dir))
     st.subheader("Detected videos")
     if files:
         for f in files:
@@ -471,7 +548,7 @@ def main():
             if not stream_key:
                 st.error("Please provide a YouTube stream key first.")
             else:
-                ok = controller.start(stream_key=stream_key, shuffle=shuffle)
+                ok = controller.start(stream_key=stream_key, shuffle=shuffle, videos_dir=str(current_videos_dir))
                 if ok:
                     st.success("Streaming started")
                 else:
@@ -485,7 +562,7 @@ def main():
                 st.info("No running FFmpeg process found.")
     with col3:
         if st.button("Rescan videos / Regenerate playlist"):
-            files = scan_and_write_playlist(str(VIDEOS_DIR), str(PLAYLIST_PATH), shuffle=shuffle)
+            files = scan_and_write_playlist(str(current_videos_dir), str(PLAYLIST_PATH), shuffle=shuffle)
             st.success(f"Regenerated playlist ({len(files)} files)")
 
     st.markdown("---")
@@ -495,6 +572,22 @@ def main():
     running = controller.is_running()
     st.write("Running" if running else "Stopped")
 
+    # Show running process info and allow force-stop for diagnostics
+    st.subheader("Running process")
+    info = controller.get_running_info()
+    if info:
+        st.write(f"PID: {info.get('pid')}")
+        st.write(f"Cmdline: {info.get('cmdline')}")
+    else:
+        st.write("No ffmpeg process found.")
+
+    if st.button("Force stop (SIGKILL)"):
+        killed = controller.force_stop()
+        if killed:
+            st.success("Force-stopped ffmpeg")
+        else:
+            st.info("No ffmpeg process was killed.")
+
     # Logs
     st.subheader("Stream log (tail)")
     logs = controller.tail_logs(lines=200)
@@ -502,7 +595,9 @@ def main():
 
     st.markdown("---")
     st.write("Playlist file is at:", str(PLAYLIST_PATH))
-    st.write("Videos folder is mounted at:", str(VIDEOS_DIR))
+    st.write("Currently using videos folder:", str(current_videos_dir))
+
+    st.markdown("**Note:** When running in Docker, ensure the host folder you want to use is mounted into the container at the same path you enter here (or use the default `/app/videos`).")
 
 
 if __name__ == "__main__":
