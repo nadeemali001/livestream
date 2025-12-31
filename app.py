@@ -40,7 +40,36 @@ FRAMERATE = os.environ.get("FRAMERATE", "30")
 # RESOLUTION example: "1920x1080" or "3840x2160". If empty, no scaling is applied.
 RESOLUTION = os.environ.get("RESOLUTION", "1920x1080")
 # Buffer size controls variability; default kept at 2x video bitrate if not provided.
-BUF_SIZE = os.environ.get("BUF_SIZE", "9000k")
+_env_buf = os.environ.get("BUF_SIZE")
+# Optional hardware encoder flag (set to '1' to enable NVENC path)
+USE_NVENC = os.environ.get("USE_NVENC", "0") in ("1", "true", "True")
+
+
+def _parse_bitrate_k(bstr: str) -> int:
+    """Parse bitrate strings like '4500k' or '23M' and return kbps as int."""
+    s = bstr.strip()
+    if s.lower().endswith('k'):
+        try:
+            return int(float(s[:-1]))
+        except Exception:
+            return int(4500)
+    if s.lower().endswith('m'):
+        try:
+            return int(float(s[:-1]) * 1000)
+        except Exception:
+            return int(4500)
+    try:
+        return int(float(s))
+    except Exception:
+        return int(4500)
+
+
+if _env_buf:
+    BUF_SIZE = _env_buf
+else:
+    # default ~2x video bitrate
+    vb_k = _parse_bitrate_k(VIDEO_BITRATE)
+    BUF_SIZE = f"{max(2000, vb_k * 2)}k"
 LOG_PATH = BASE_DIR / "stream.log"
 PID_PATH = BASE_DIR / "ffmpeg_stream.pid"
 
@@ -131,7 +160,19 @@ class StreamController:
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
         # x264 params: enforce constant keyint/gop and disable scenecut for stable GOPs
         x264_params = "keyint=60:min-keyint=60:no-scenecut=1"
-        cmd = [
+
+        # Choose H.264 level based on resolution; 4K often requires level 5.1
+        level = "4.2"
+        if RESOLUTION and "x" in RESOLUTION:
+            try:
+                w, h = [int(x) for x in RESOLUTION.split('x')]
+                if max(w, h) >= 3840:
+                    level = "5.1"
+            except Exception:
+                pass
+
+        # Build basic input + encoding params; choose software or NVENC path later
+        base = [
             "ffmpeg",
             "-re",
             "-f",
@@ -145,7 +186,9 @@ class StreamController:
             # input handling
             "-fflags",
             "+genpts",
-            # video encoding
+        ]
+
+        sw_video = [
             "-c:v",
             "libx264",
             "-preset",
@@ -153,7 +196,7 @@ class StreamController:
             "-profile:v",
             "high",
             "-level:v",
-            "4.2",
+            level,
             "-x264-params",
             x264_params,
             "-threads",
@@ -172,9 +215,33 @@ class StreamController:
             "60",
         ]
 
+        # Hardware encoder parameters (NVENC) — requires host with NVIDIA GPU and ffmpeg built with nvenc
+        hw_video = [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-b:v",
+            VIDEO_BITRATE,
+            "-maxrate",
+            VIDEO_BITRATE,
+            "-bufsize",
+            BUF_SIZE,
+            "-r",
+            FRAMERATE,
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "60",
+        ]
+
+        cmd = base + (hw_video if USE_NVENC else sw_video)
+
         # Optionally scale to target resolution (don't upscale by default unless requested)
         if RESOLUTION:
-            # Add a video filter to scale; use -s if you prefer a direct size flag
+            # Add a video filter to scale; avoid upscaling low-res content artificially
             cmd.extend(["-vf", f"scale={RESOLUTION}"])
 
         # continue building command with audio and output

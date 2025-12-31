@@ -16,6 +16,7 @@ services:
       - RESOLUTION=${RESOLUTION:-1920x1080}
       - FRAMERATE=${FRAMERATE:-30}
       - BUF_SIZE=${BUF_SIZE:-9000k}
+      - USE_NVENC=${USE_NVENC:-0}
     restart: always
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
