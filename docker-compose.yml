@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  streamer:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./videos:/Users/nadeemali/Movies/VN/Uploaded/videos
+      - ./stream.log:/app/stream.log
+      - ./playlist.txt:/Users/nadeemali/Movies/VN/Uploaded/playlist.txt
+    environment:
+      # You can also set STREAM_KEY here or pass it via docker-compose override / env file
+      - STREAM_KEY=${STREAM_KEY}
+      - VIDEO_BITRATE=${VIDEO_BITRATE:-4500k}
+      - AUDIO_BITRATE=${AUDIO_BITRATE:-160k}
+      - RESOLUTION=${RESOLUTION:-1920x1080}
+      - FRAMERATE=${FRAMERATE:-30}
+      - BUF_SIZE=${BUF_SIZE:-9000k}
+    restart: always
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

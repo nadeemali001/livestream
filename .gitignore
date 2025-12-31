@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+
+# Logs and runtime files
+stream.log
+ffmpeg_stream.pid
+playlist.txt
+
+# Videos (do not commit large media files)
+videos/
+
+# Environment files
+.env
